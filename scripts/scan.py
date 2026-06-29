@@ -113,12 +113,13 @@ def autonomous_decision(scan_type, watchlist, positions, rules, journal_tail,
 - 買い/売りの最終判断もClaudeが自律的に行う（kotobの承認待ちは不要）。
 - 損切り・利確ラインもClaudeが地合い・ファンダ・地政学を考慮して自動計算する。
 - kotobのコメントがあれば参考にするが、なくても自律的に判断・実行する。
+- **ウォッチリストが空でも止まらない**。事前登録された銘柄がなくても、今回の地合い・テーマ（AI・半導体・ロボット・高市政権戦略分野・IPO等）から自分でスクリーニングし、具体的な銘柄コードを挙げて判断する。「スクリーニング未実施」で待つのではなく、今回のスキャンの中で完結させる。
 - ⚠️ これは投資助言ではなく、テスト運用内の自己学習用シミュレーションである。
 {notes_section}
 ## 売買ルール
 {rules}
 
-## 現在のウォッチリスト
+## 現在のウォッチリスト（空の場合は自分でスクリーニングして候補銘柄を挙げる）
 {watchlist}
 
 ## 保有ポジション
@@ -136,10 +137,12 @@ def autonomous_decision(scan_type, watchlist, positions, rules, journal_tail,
 ## 依頼
 今回のスキャンで以下を行い、JSON形式で結果を返してください。
 
-1. 地合い・ウォッチリスト・保有銘柄を分析
-2. 新規エントリー（買い）すべき銘柄があれば判断し、エントリー価格・損切り・利確ラインを計算
-3. 既存保有銘柄で売却（損切り/利確/継続保有）すべきか判断
-4. 判断結果をCSVに記録する内容を生成
+1. 地合い・地政学・テーマ性から、今回のスキャンで注目すべき具体的な銘柄を自分でスクリーニングする（ウォッチリストが空でもここで完結させる。実在する銘柄コードを使うこと）
+2. 保有銘柄を分析
+3. 新規エントリー（買い）すべき銘柄があれば判断し、エントリー価格・損切り・利確ラインを計算（ポジションサイジングは売買ルールの計算手順に従う）
+4. 既存保有銘柄で売却（損切り/利確/継続保有）すべきか判断
+5. 判断結果をCSVに記録する内容を生成
+6. スクリーニングで見つけた候補（買わなかったものも含む）を screened_candidates に記録する
 
 JSON形式（これのみを返す。前後に説明文不要）:
 
@@ -168,6 +171,9 @@ JSON形式（これのみを返す。前後に説明文不要）:
       "sell_price": 1234.5,
       "holdings_csv_updated_row": "既存行を売却情報で更新した1行全体"
     }}
+  ],
+  "screened_candidates": [
+    {{ "code": "銘柄コード", "name": "銘柄名", "verdict": "買い/見送り/監視継続", "reason": "理由（1行）" }}
   ],
   "journal_entry": "トレード日誌に残す本文（マークダウン、見出し不要、本文のみ）"
 }}
@@ -295,6 +301,13 @@ def main():
     if not decisions_text:
         decisions_text = "\n（今回は新規エントリー・売却なし）\n"
 
+    screened = result.get("screened_candidates", [])
+    screened_text = ""
+    if screened:
+        screened_text = "\n**今回スクリーニングした銘柄**\n"
+        for c in screened:
+            screened_text += f"- {c.get('name','')}({c.get('code','')}): {c.get('verdict','')} — {c.get('reason','')}\n"
+
     entry = f"""
 ---
 
@@ -305,7 +318,7 @@ def main():
 
 **判断・実行内容**
 {decisions_text}
-
+{screened_text}
 {result.get('journal_entry', '')}
 """
     new_journal = entry + "\n" + journal
