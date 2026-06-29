@@ -2,7 +2,7 @@
 """
 自動スキャンスクリプト
 GitHub Actionsから呼び出される。Anthropic APIでClaudeにスキャンを依頼し、結果をリポに書き戻す。
-kotobのコメントをアクション候補ファイルから読み取り、対応も行う。
+買い判断時は損切り・利確ラインをClaudeが地合い・ファンダを考慮して自動計算・設定する。
 """
 import os, sys, json, subprocess, base64, datetime, urllib.parse, re
 
@@ -49,7 +49,7 @@ def write_file(path, content, message, sha=None, branch="main"):
 
 # ── Anthropic API helper ────────────────────────────────────────────
 
-def call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=2000):
+def call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=3000):
     body = {"model": model, "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}]}
     r = subprocess.run(
@@ -68,7 +68,6 @@ def call_claude(prompt, model="claude-haiku-4-5-20251001", max_tokens=2000):
 # ── アクション候補ファイルのコメント処理 ────────────────────────────
 
 def parse_action_comments(actions_md):
-    """kotobコメント欄に記入があるアクション候補を抽出する"""
     pending = []
     lines = actions_md.splitlines()
     in_table = False
@@ -80,7 +79,6 @@ def parse_action_comments(actions_md):
             cols = [c.strip() for c in line.split("|")[1:-1]]
             if len(cols) >= 5:
                 ticker_name, code, action, reason, comment = cols[0], cols[1], cols[2], cols[3], cols[4]
-                # コメントが空・「← ここに記入」以外なら処理対象
                 if comment and comment not in ("", "← ここに記入", "（対応済み）"):
                     pending.append({
                         "name": ticker_name, "code": code,
@@ -93,7 +91,6 @@ def parse_action_comments(actions_md):
 def handle_comments(pending_items, holdings_csv, holdings_sha,
                     summary_csv, summary_sha, decisions_csv, decisions_sha,
                     actions_md, actions_sha):
-    """コメント付きアクション候補をClaudeに渡して対応を判断・実行する"""
     if not pending_items:
         return "コメントなし"
 
@@ -107,7 +104,7 @@ def handle_comments(pending_items, holdings_csv, holdings_sha,
 
     prompt = f"""あなたは株式売買サポートシステムのClaudeです。
 実行日時: {date_str}
-テスト運用（ペーパートレード）です。実弾の発注は行いません。
+テスト運用（ペーパートレード）。実弾の発注は行いません。
 
 kotobが以下のアクション候補にコメントを記入しました。
 対応内容をJSON形式で返してください。
@@ -152,14 +149,12 @@ kotobが以下のアクション候補にコメントを記入しました。
 - trade_decisions.csvのヘッダー: 判断ID,銘柄コード,市場,銘柄名,判断日時,判断種別,判断,根拠カテゴリ,推奨アクション,信頼度,エントリー候補価格,損切り候補価格,利確候補価格,投資方針summary,詳細メモ
 - 「yes」「やる」「ok」「買い」などは実行と解釈
 - 「no」「見送り」「やめ」などは見送りと解釈
-- 「様子見」「保留」などは保留と解釈
 - JSONのみ返してください（説明文不要）
 """
 
     print("[scan.py] Processing kotob comments with Claude...")
     response_text = call_claude(prompt, max_tokens=3000)
 
-    # JSON抽出
     try:
         json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not json_match:
@@ -171,7 +166,6 @@ kotobが以下のアクション候補にコメントを記入しました。
     responses = result.get("responses", [])
     journal_note = result.get("journal_note", "")
 
-    # holdings.csv更新
     new_holdings = holdings_csv
     for resp in responses:
         row = resp.get("holdings_csv_update")
@@ -184,13 +178,10 @@ kotobが以下のアクション候補にコメントを記入しました。
                         holdings_sha)
         print(f"[scan.py] holdings.csv update: {'OK' if ok else 'FAILED'}")
 
-    # holdings_summary.csv更新（損切り・利確ラインなど）
-    # summaryはシンプルにメモのみ更新（価格更新は別途）
     new_summary = summary_csv
     for resp in responses:
         su = resp.get("summary_update")
         if su and su.get("fields"):
-            # 対象行を探して該当フィールドを更新
             lines = new_summary.splitlines()
             headers = lines[0].split(",") if lines else []
             updated_lines = []
@@ -214,7 +205,6 @@ kotobが以下のアクション候補にコメントを記入しました。
                         s_sha)
         print(f"[scan.py] holdings_summary.csv update: {'OK' if ok else 'FAILED'}")
 
-    # trade_decisions.csv更新
     new_decisions = decisions_csv or ""
     for resp in responses:
         row = resp.get("decisions_csv_row")
@@ -228,19 +218,15 @@ kotobが以下のアクション候補にコメントを記入しました。
                         d_sha)
         print(f"[scan.py] trade_decisions.csv update: {'OK' if ok else 'FAILED'}")
 
-    # アクション候補ファイルの対応状況を更新（「← ここに記入」→実際のコメント+対応済みマーク）
     new_actions = actions_md
     for resp in responses:
         status = resp.get("actions_status", "（対応済み）")
         comment = resp.get("comment", "")
-        # コメントが入っている行の対応状況を更新
-        # テーブル行のkotobコメント欄を「コメント → 対応済み」に変更
         new_actions = new_actions.replace(
             f"| {comment} |",
             f"| {comment} → {status} |"
         )
 
-    # 過去エントリーへ移動
     for resp in responses:
         action_status = resp.get("actions_status", "対応済み")
         interp = resp.get("interpretation", "")
@@ -255,6 +241,78 @@ kotobが以下のアクション候補にコメントを記入しました。
     print(f"[scan.py] actions.md update: {'OK' if ok else 'FAILED'}")
 
     return journal_note
+
+# ── 損切り・利確の自動計算（地合い・ファンダ考慮） ──────────────────
+
+def calculate_stop_and_target(entry_price, ticker_code, ticker_name, market,
+                               investment_type, macro_context):
+    """
+    地合い・ファンダメンタルを考慮して損切り・利確ラインを自動計算する。
+    デフォルト: 損切り-7%, 利確RR1:2
+    地政学リスク・ボラ・IPO種別・トレンド強度で調整。
+    """
+    prompt = f"""あなたは株式売買リスク管理担当のClaudeです。
+テスト運用（ペーパートレード）です。
+
+## 対象銘柄
+- 銘柄: {ticker_name}（{ticker_code}）
+- 市場: {market}
+- 投資方針: {investment_type}
+- エントリー価格: {entry_price}
+
+## 現在のマクロ・地政学コンテキスト
+{macro_context}
+
+## デフォルトルール
+- 損切り: エントリーから -7%
+- 利確: リスクリワード 1:2（損切り幅×2）
+
+## 調整基準
+- 高ボラ相場・地政学リスク高 → -9〜10%に広げる
+- 強トレンド・低ボラ → -5%に絞る
+- IPO銘柄（初値直後） → -10〜12%を許容
+- 決算またぎ → -5%以内
+- 強いトレンド継続・テーマ性高 → RR1:3に延ばす
+- 地合い悪化・上値重い → RR1:1.5に短縮
+- IPO銘柄初動勢い強 → RR1:3〜1:5も視野
+
+## 指示
+上記の情報と現在の地合いを踏まえて、最適な損切り・利確ラインを計算し、
+以下のJSONのみを返してください：
+
+{{
+  "stop_loss_pct": -7.0,
+  "stop_loss_price": 149.63,
+  "take_profit_pct": 14.0,
+  "take_profit_price": 182.54,
+  "rr_ratio": "1:2",
+  "adjustment_reason": "調整理由を1〜2行で"
+}}
+
+価格は小数点2桁まで。JSONのみ返してください。
+"""
+
+    response = call_claude(prompt, max_tokens=500)
+    try:
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    except Exception:
+        pass
+
+    # フォールバック: デフォルト値
+    stop_pct = -7.0
+    stop_price = round(entry_price * (1 + stop_pct / 100), 2)
+    tp_pct = abs(stop_pct) * 2
+    tp_price = round(entry_price * (1 + tp_pct / 100), 2)
+    return {
+        "stop_loss_pct": stop_pct,
+        "stop_loss_price": stop_price,
+        "take_profit_pct": tp_pct,
+        "take_profit_price": tp_price,
+        "rr_ratio": "1:2",
+        "adjustment_reason": "デフォルト値を適用（API応答エラーのため）"
+    }
 
 # ── プロンプト構築 ───────────────────────────────────────────────────
 
@@ -285,8 +343,9 @@ def build_prompt(scan_type, watchlist, positions, rules, journal_tail, actions_s
 
 ## システム前提
 - テスト運用（ペーパートレード）。実弾の発注は行わない。
-- 最終判断は必ずkotob本人。あなたは判断材料（根拠・シナリオ・リスク・反対意見）を整理して出す。
-- 「買い/売り推奨」ではなく、判断材料を整理する立場。
+- 最終判断はkotob本人（買う/売るのYes/Noのみ）。
+- 損切り・利確ラインはClaudeが地合い・ファンダ・地政学を考慮して自動計算・設定する。
+- kotobのルール変更指示は例外時のみ。
 - ⚠️ あなたは金融アドバイザーではなく、これは投資助言ではありません。
 
 ## 今回のフォーカス
@@ -298,8 +357,8 @@ def build_prompt(scan_type, watchlist, positions, rules, journal_tail, actions_s
 ## 保有ポジション
 {positions}
 
-## 売買ルール（抜粋）
-{rules[:800]}
+## 売買ルール
+{rules}
 
 ## 直近のトレード日誌（末尾）
 {journal_tail}
@@ -319,7 +378,7 @@ def build_prompt(scan_type, watchlist, positions, rules, journal_tail, actions_s
 （損切り・利確・継続保有の判断材料を箇条書きで）
 
 **推奨アクション候補**
-（kotobへの提案。Yes/Noで判断できる形で。なければ「なし」）
+（kotobへの提案。「買う？Yes/No」「売る？Yes/No」の形で。損切り・利確ラインはClaudeが自動設定済みとして記載。なければ「なし」）
 
 **リスク・反対意見**
 （上記アクションのリスクや慎重意見）
@@ -342,19 +401,33 @@ def main():
     if not all([watchlist, positions, rules, journal]):
         print("ERROR: ファイル読み込み失敗"); sys.exit(1)
 
-    # kotobコメント処理
+    # kotobコメント処理（買いYesなら損切り・利確も自動計算）
     journal_note = ""
     if actions:
         pending = parse_action_comments(actions)
         if pending:
             print(f"[scan.py] Found {len(pending)} pending comment(s) from kotob")
+
+            # 買いYesのコメントには損切り・利確を自動計算してコンテキストに追加
+            macro_context = "\n".join(journal.splitlines()[:20])  # 日誌冒頭をマクロ情報として使用
+            for item in pending:
+                comment_lower = item["comment"].lower()
+                is_buy = any(k in comment_lower for k in ["yes", "やる", "ok", "買い", "買う"])
+                if is_buy and item.get("entry_price"):
+                    lines = calculate_stop_and_target(
+                        item["entry_price"], item["code"], item["name"],
+                        item.get("market", ""), item.get("action", "スイング"),
+                        macro_context
+                    )
+                    item["stop_loss_info"] = lines
+                    print(f"[scan.py] Stop/target calculated for {item['code']}: {lines}")
+
             journal_note = handle_comments(
                 pending, holdings or "", h_sha,
                 summary or "", s_sha,
                 decisions or "", d_sha,
                 actions, a_sha
             )
-            # 処理後のアクションファイルを再読み込み（SHAが変わるため）
             actions, a_sha = read_file("アクション候補_actions.md")
         else:
             print("[scan.py] No pending comments in actions file")
@@ -373,7 +446,6 @@ def main():
     entry = f"\n---\n\n## {now.strftime('%Y-%m-%d')} — 自動スキャン ({SCAN_TYPE})\n{note_section}\n{result}\n"
     new_journal = entry + "\n" + journal
 
-    # journalのSHAを再取得（actions処理でSHAが変わっている可能性）
     _, j_sha_fresh = read_file("トレード日誌_journal.md")
     ok = write_file("トレード日誌_journal.md", new_journal,
                     f"scan({SCAN_TYPE}): {now.strftime('%Y-%m-%d %H:%M JST')}", j_sha_fresh)
@@ -382,7 +454,7 @@ def main():
     else:
         print("[scan.py] ERROR: journal write failed"); sys.exit(1)
 
-    # アクション候補ファイルに今回のスキャン結果の推奨アクションを追記
+    # アクション候補ファイルに今回スキャン結果を追記
     if actions and a_sha:
         now_str = now.strftime("%Y-%m-%d")
         scan_label = {
@@ -392,7 +464,6 @@ def main():
             "weekly": "週次レビュー",
         }.get(SCAN_TYPE, SCAN_TYPE)
 
-        # 推奨アクション候補セクションを抽出してactions.mdに追記
         action_lines = []
         in_action = False
         for line in result.splitlines():
@@ -402,17 +473,15 @@ def main():
             if in_action and line.startswith("**") and "推奨アクション候補" not in line:
                 break
             if in_action and line.strip() and line.strip() != "なし":
-                # 箇条書き行をテーブル行に変換
                 text = line.lstrip("- ").strip()
                 if text:
                     action_lines.append(text)
 
         if action_lines:
             new_section = f"\n## {now_str} — {scan_label}\n\n"
-            new_section += "| 銘柄 | コード | 候補アクション | 根拠・メモ | kotobコメント |\n"
-            new_section += "|------|--------|--------------|-----------|-------------|\n"
-            for al in action_lines[:5]:  # 最大5件
-                # 「銘柄名(コード): アクション — 根拠」形式を想定
+            new_section += "| 銘柄 | コード | 候補アクション | 根拠・メモ（損切り/利確はClaudeが自動設定） | kotobコメント |\n"
+            new_section += "|------|--------|--------------|------------------------------------------|-------------|\n"
+            for al in action_lines[:5]:
                 parts = al.split(":", 1)
                 if len(parts) == 2:
                     ticker_part = parts[0].strip()
@@ -422,12 +491,11 @@ def main():
                     reason_text = reason_parts[1].strip() if len(reason_parts) > 1 else ""
                 else:
                     ticker_part = ""
-                    action_text = al[:50]
+                    action_text = al[:60]
                     reason_text = ""
                 new_section += f"| {ticker_part} | | {action_text} | {reason_text} | ← ここに記入 |\n"
             new_section += "\n---\n"
 
-            # 最初の --- の前に挿入
             updated_actions = actions.replace(
                 "\n---\n\n## ",
                 new_section + "\n## ",
