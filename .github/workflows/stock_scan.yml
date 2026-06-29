@@ -1,0 +1,61 @@
+name: Stock Scan
+
+on:
+  schedule:
+    - cron: '0 1 * * 1-5'   # 10:00 JST 月〜金（日本株 寄り前）
+    - cron: '0 4 * * 1-5'   # 13:00 JST 月〜金（日本株 大引け前）
+    - cron: '0 15 * * 1-5'  # 0:00 JST 火〜土（米国株 寄り前）
+    - cron: '0 7 * * 5'     # 16:00 JST 金（週次レビュー）
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'スキャン種別'
+        required: true
+        default: 'japan_morning'
+        type: choice
+        options:
+          - japan_morning
+          - japan_afternoon
+          - us_morning
+          - weekly
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set scan type
+        id: scan_type
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "type=${{ inputs.scan_type }}" >> $GITHUB_OUTPUT
+          else
+            HOUR=$(date -u +%H)
+            MIN=$(date -u +%M)
+            DOW=$(date -u +%u)
+            if [ "$HOUR" = "01" ]; then
+              echo "type=japan_morning" >> $GITHUB_OUTPUT
+            elif [ "$HOUR" = "04" ]; then
+              echo "type=japan_afternoon" >> $GITHUB_OUTPUT
+            elif [ "$HOUR" = "15" ]; then
+              echo "type=us_morning" >> $GITHUB_OUTPUT
+            elif [ "$HOUR" = "07" ] && [ "$DOW" = "5" ]; then
+              echo "type=weekly" >> $GITHUB_OUTPUT
+            else
+              echo "type=japan_morning" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Install dependencies
+        run: pip install anthropic
+
+      - name: Run scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/scan.py ${{ steps.scan_type.outputs.type }}
