@@ -384,12 +384,70 @@ def update_actions_md(actions_md, result, scan_type, now):
         return md[:idx + 3] + new_section + md[idx + 3:]
     return md + new_section
 
+# ── ウォッチリスト.md 更新 ─────────────────────────────────────────────
+
+def update_watchlist_md(watchlist_md, result, now):
+    """screened_candidates の「監視継続」銘柄をウォッチリストに追加する（未登録のみ）"""
+    monitored = [c for c in result.get("screened_candidates", [])
+                 if c.get("verdict") == "監視継続"]
+    if not monitored:
+        return None
+
+    md = watchlist_md or ""
+    date_str = now.strftime("%Y-%m-%d")
+    changed = False
+
+    for c in monitored:
+        code = str(c.get("code", "")).strip()
+        if not code or code in md:
+            continue
+        name = c.get("name", "")
+        reason = c.get("reason", "")[:60]
+        is_japan = bool(re.match(r'^\d{3,4}[A-Z]?$', code))
+        section_header = "## 日本株(個別)" if is_japan else "## 米国株(個別)"
+        new_row = f"| {name} | {code} | ★★ | {reason} |  |  |  | 監視中 | {date_str} |"
+
+        lines = md.splitlines()
+        new_lines = []
+        in_section = False
+        inserted = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped == section_header:
+                in_section = True
+            elif stripped.startswith("## ") and in_section:
+                if not inserted:
+                    new_lines.append(new_row)
+                    inserted = True
+                in_section = False
+
+            if in_section and not inserted and stripped.startswith("| (未)"):
+                new_lines.append(new_row)
+                inserted = True
+
+            new_lines.append(line)
+
+        if not inserted and in_section:
+            new_lines.append(new_row)
+            inserted = True
+
+        if inserted:
+            md = "\n".join(new_lines)
+            changed = True
+
+    if not changed:
+        return None
+
+    md = re.sub(r'(最終更新: )[^\n]+', rf'\g<1>{date_str}（自動更新）', md)
+    return md
+
 # ── メイン ───────────────────────────────────────────────────────────
 
 def main():
     print(f"[scan.py] scan_type={SCAN_TYPE}")
 
-    watchlist, _     = read_file("ウォッチリスト_watchlist.md")
+    watchlist, w_sha = read_file("ウォッチリスト_watchlist.md")
     positions, _     = read_file("保有ポジション_positions.md")
     rules, _         = read_file("売買ルール_trading_rules.md")
     journal, j_sha   = read_file("トレード日誌_journal.md")
@@ -494,6 +552,15 @@ def main():
             ok = write_file("アクション候補_actions.md", new_actions,
                             f"scan({SCAN_TYPE}): アクション候補更新 {now.strftime('%Y-%m-%d %H:%M JST')}", a_sha_fresh)
             print(f"[scan.py] アクション候補更新: {'OK' if ok else 'FAILED'}")
+
+    # ウォッチリスト.md 更新（監視継続銘柄の自動追記）
+    if result.get("screened_candidates"):
+        watchlist_fresh, w_sha_fresh = read_file("ウォッチリスト_watchlist.md")
+        new_watchlist = update_watchlist_md(watchlist_fresh, result, now)
+        if new_watchlist:
+            ok = write_file("ウォッチリスト_watchlist.md", new_watchlist,
+                            f"scan({SCAN_TYPE}): ウォッチリスト更新 {now.strftime('%Y-%m-%d %H:%M JST')}", w_sha_fresh)
+            print(f"[scan.py] ウォッチリスト更新: {'OK' if ok else 'FAILED'}")
 
 if __name__ == "__main__":
     main()
