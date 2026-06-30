@@ -1,4 +1,4 @@
-name: Stock Scan
+name: 自動スキャン
 
 on:
   schedule:
@@ -26,17 +26,16 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
+      - name: チェックアウト
         uses: actions/checkout@v4
 
-      - name: Set scan type
+      - name: スキャン種別を設定
         id: scan_type
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "type=${{ inputs.scan_type }}" >> $GITHUB_OUTPUT
           else
             HOUR=$(date -u +%H)
-            MIN=$(date -u +%M)
             DOW=$(date -u +%u)
             if [ "$HOUR" = "01" ]; then
               echo "type=japan_morning" >> $GITHUB_OUTPUT
@@ -51,7 +50,7 @@ jobs:
             fi
           fi
 
-      - name: Run scan
+      - name: スキャン実行
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
