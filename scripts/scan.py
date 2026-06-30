@@ -678,5 +678,193 @@ def main():
                             f"scan({SCAN_TYPE}): ウォッチリスト更新 {now.strftime('%Y-%m-%d %H:%M JST')}", w_sha_fresh)
             print(f"[scan.py] ウォッチリスト更新: {'OK' if ok else 'FAILED'}")
 
+    # 週次レビュー.md 更新（週次スキャンのみ）
+    if SCAN_TYPE == "weekly":
+        weekly_stats = get_weekly_stats(h_latest, now)
+        qualitative = weekly_review_analysis(weekly_stats, journal_tail, now)
+        review_section = build_weekly_review_section(weekly_stats, qualitative, now)
+        weekly_review_md, wr_sha = read_file("週次レビュー_weekly_review.md")
+        wr_md = weekly_review_md or ""
+        if "---" in wr_md:
+            idx = wr_md.index("---")
+            new_wr = wr_md[:idx + 3] + "\n" + review_section + "\n" + wr_md[idx + 3:]
+        else:
+            new_wr = wr_md + review_section
+        ok = write_file("週次レビュー_weekly_review.md", new_wr,
+                        f"scan({SCAN_TYPE}): 週次レビュー更新 {now.strftime('%Y-%m-%d %H:%M JST')}", wr_sha)
+        print(f"[scan.py] 週次レビュー更新: {'OK' if ok else 'FAILED'}")
+
+# ── 週次レビュー ─────────────────────────────────────────────────────
+
+def get_weekly_stats(holdings_csv, now):
+    """直近7日の実現損益・確定取引・現在ポジションを集計する"""
+    week_start = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    all_lines = (holdings_csv or "").strip().split("\n")
+    before_csv = "\n".join(
+        line for i, line in enumerate(all_lines)
+        if i == 0 or (
+            line.strip() and
+            len(line.split(",")) > 1 and
+            line.split(",")[1].strip()[:10] < week_start
+        )
+    )
+    state_before = calculate_positions(before_csv)
+    state_now    = calculate_positions(holdings_csv or "")
+
+    weekly_trades = []
+    for code, s_now in state_now.items():
+        pnl_now    = s_now.get("realized_pnl", 0)
+        pnl_before = state_before.get(code, {}).get("realized_pnl", 0)
+        if abs(pnl_now - pnl_before) > 0.001:
+            weekly_trades.append({
+                "code":   code,
+                "name":   s_now["name"],
+                "market": s_now["market"],
+                "pnl":    round(pnl_now - pnl_before, 2),
+            })
+
+    active = {c: s for c, s in state_now.items() if s.get("position", 0) > 0}
+    return {"week_start": week_start, "weekly_trades": weekly_trades, "active_positions": active}
+
+
+def weekly_review_analysis(stats, journal_tail, now):
+    """週次レビューの定性分析を Claude に依頼する"""
+    date_str = now.strftime("%Y-%m-%d")
+
+    jpy_markets = ("東証P", "東証S", "東証G")
+    usd_markets = ("米国", "NYSE", "NASDAQ")
+    trades = stats["weekly_trades"]
+    active = stats["active_positions"]
+
+    trades_text = "\n".join(
+        f"- {t['name']}({t['code']}): "
+        f"{'＋' if t['pnl'] >= 0 else ''}{t['pnl']:,.1f} "
+        f"({'JPY' if t['market'] in jpy_markets else 'USD'})"
+        for t in trades
+    ) if trades else "今週の確定取引なし"
+
+    positions_text = "\n".join(
+        f"- {s['name']}({code}) {s['market']}: "
+        f"{int(s['position'])}株 @ {round(s['avg_cost'], 0):,.0f}"
+        for code, s in active.items()
+    ) if active else "保有なし"
+
+    prompt = f"""あなたは株式売買サポートシステムのClaudeです。
+実行日時: {date_str} JST（週次レビュー 金曜 16:00）
+
+## 今週の集計
+集計期間: {stats['week_start']} 〜 {date_str}
+
+### 確定損益
+{trades_text}
+
+### 週末時点の保有ポジション
+{positions_text}
+
+### 直近のトレード日誌
+{journal_tail}
+
+## 依頼
+今週のトレードを振り返り、以下のJSONのみ返してください。
+確定取引がない場合はポジション管理・地合い観察の観点で分析してください。
+
+{{
+  "plus_factors": ["今週うまくいった判断・要因（最大3項目）"],
+  "minus_factors": ["今週のマイナス要因・反省点（最大3項目）"],
+  "learnings": ["来週に活かす具体的な改善アクション（1〜3項目）"],
+  "next_week_focus": "来週の重点テーマ・注目セクター（1〜2行）"
+}}
+
+JSONのみ返してください（前後に説明文不要）。
+"""
+    print("[scan.py] 週次レビュー分析をClaudeに依頼中...")
+    response_text = call_claude(prompt, max_tokens=2000)
+
+    try:
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not json_match:
+            raise ValueError("JSONが見つかりません")
+        return json.loads(json_match.group())
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[scan.py] WARNING: 週次レビューJSONパースエラー: {e}")
+        return {
+            "plus_factors": ["(分析エラー)"],
+            "minus_factors": ["(分析エラー)"],
+            "learnings": ["(分析エラー)"],
+            "next_week_focus": "(分析エラー)",
+        }
+
+
+def build_weekly_review_section(stats, qualitative, now):
+    """週次レビューの Markdown セクションを生成する"""
+    week_str   = now.strftime("%Y-%m-%d")
+    week_start = stats["week_start"]
+    trades     = stats["weekly_trades"]
+    active     = stats["active_positions"]
+
+    jpy_markets = ("東証P", "東証S", "東証G")
+    usd_markets = ("米国", "NYSE", "NASDAQ")
+    jpy_trades  = [t for t in trades if t["market"] in jpy_markets]
+    usd_trades  = [t for t in trades if t["market"] in usd_markets]
+    jpy_pnl     = sum(t["pnl"] for t in jpy_trades)
+    usd_pnl     = sum(t["pnl"] for t in usd_trades)
+    jpy_wins    = sum(1 for t in jpy_trades if t["pnl"] > 0)
+    usd_wins    = sum(1 for t in usd_trades if t["pnl"] > 0)
+
+    def rate(wins, total):
+        return f"{wins}/{total}件" if total else "−"
+
+    sell_rows = "\n".join(
+        f"| {t['name']} | {t['code']} | {t['market']} "
+        f"| {'＋' if t['pnl'] >= 0 else ''}{t['pnl']:,.1f} |"
+        for t in trades
+    ) if trades else "| （今週の確定取引なし） | | | |"
+
+    pos_rows = "\n".join(
+        f"| {s['name']} | {code} | {s['market']} "
+        f"| {int(s['position'])} | {round(s['avg_cost'], 0):,.0f} | — |"
+        for code, s in active.items()
+    ) if active else "| （保有なし） | | | | | |"
+
+    plus   = "\n".join(f"- {p}" for p in qualitative.get("plus_factors", ["（特になし）"]))
+    minus  = "\n".join(f"- {m}" for m in qualitative.get("minus_factors", ["（特になし）"]))
+    learns = "\n".join(f"- {l}" for l in qualitative.get("learnings", ["（なし）"]))
+    focus  = qualitative.get("next_week_focus", "")
+
+    return f"""
+
+## {week_str}（週次レビュー）
+集計期間: {week_start} 〜 {week_str}
+
+### 損益サマリー
+| 通貨 | 実現損益 | 確定数 | 勝ち | 勝率 |
+|---|---|---|---|---|
+| JPY | ¥{jpy_pnl:+,.1f} | {len(jpy_trades)}件 | {jpy_wins}件 | {rate(jpy_wins, len(jpy_trades))} |
+| USD | ${usd_pnl:+,.1f} | {len(usd_trades)}件 | {usd_wins}件 | {rate(usd_wins, len(usd_trades))} |
+
+#### 今週の確定取引
+| 銘柄 | コード | 市場 | 実現損益 |
+|---|---|---|---|
+{sell_rows}
+
+### 保有ポジション（週末時点）
+| 銘柄 | コード | 市場 | 株数 | 平均取得 | 含み損益 |
+|---|---|---|---|---|---|
+{pos_rows}
+> ※含み損益はリアルタイム非対応のため「—」。
+
+### ◎ プラス要因
+{plus}
+
+### × マイナス要因
+{minus}
+
+### → 学び・次週の改善アクション
+{learns}
+
+**来週の重点テーマ**: {focus}
+"""
+
 if __name__ == "__main__":
     main()
