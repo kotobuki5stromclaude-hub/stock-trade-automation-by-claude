@@ -144,6 +144,21 @@ def autonomous_decision(scan_type, watchlist, positions, rules, journal_tail,
 5. 判断結果をCSVに記録する内容を生成
 6. スクリーニングで見つけた候補（買わなかったものも含む）を screened_candidates に記録する
 
+## CSVヘッダー（厳守）
+- holdings.csv (15列): 取引ID,ステータス,取得日時,銘柄コード,市場,銘柄名,取得株数,取得単価,取得金額,売却日時,売却株数,売却単価,売却金額,損益,メモ
+- trade_decisions.csv (12列): 判断日時,判断種別,銘柄コード,市場,銘柄名,判断,根拠カテゴリ,根拠詳細,参考株価,推奨アクション,信頼度,メモ
+- holdings_summary.csv (12列): 銘柄コード,市場,銘柄名,投資方針,保有株数,平均取得単価,取得総額,現在株価,評価額,評価損益,評価損益率,最終更新日時
+
+## holdings.csv 行の例
+- 新規買い: T0011,保有中,2026-07-01 10:00,6324,東証P,ハーモニック・ドライブ・システムズ,6,7200,43200,,,,,,テスト約定。理由
+- 売却更新: T0011,売却済,2026-06-30 10:15,6324,東証P,ハーモニック・ドライブ・システムズ,6,7200,43200,2026-07-01 10:00,6,7500,45000,1800,利確
+
+## trade_decisions.csv 行の例
+- 買い: 2026-07-01 10:00,買い判断,6324,東証P,ハーモニック・ドライブ・システムズ,買い推奨,テーマ性+テクニカル,根拠の詳細説明,7200,打診買い実行,高,損切り6696/利確8304
+
+## 次の取引IDについて
+現在の最大取引IDをholdings.csvから読み取り、次の番号(T000X)を採番してください。
+
 JSON形式（これのみを返す。前後に説明文不要）:
 
 {{
@@ -160,16 +175,20 @@ JSON形式（これのみを返す。前後に説明文不要）:
       "stop_loss_price": 1148.0,
       "take_profit_price": 1420.0,
       "reasoning": "判断理由（地合い・テクニカル・ファンダ）",
-      "holdings_csv_row": "T0005,...(ヘッダーに沿った1行)",
-      "decisions_csv_row": "D0005,...(ヘッダーに沿った1行)"
+      "trade_id": "T0011",
+      "holdings_csv_row": "T0011,保有中,2026-07-01 10:00,銘柄コード,市場,銘柄名,100,1234.5,123450,,,,,,テスト約定。理由",
+      "decisions_csv_row": "2026-07-01 10:00,買い判断,銘柄コード,市場,銘柄名,買い推奨,根拠カテゴリ,根拠詳細,1234.5,打診買い実行,高,損切りXXX/利確YYY",
+      "summary_csv_row": "銘柄コード,市場,銘柄名,スイング中期,100,1234.5,123450,,,,,"
     }}
   ],
   "sells": [
     {{
       "code": "銘柄コード",
+      "trade_id": "T0011",
       "reason": "損切り/利確/継続保有判断の理由",
       "sell_price": 1234.5,
-      "holdings_csv_updated_row": "既存行を売却情報で更新した1行全体"
+      "holdings_csv_updated_row": "T0011,売却済,取得日時,銘柄コード,市場,銘柄名,株数,取得単価,取得総額,売却日時,株数,売却単価,売却総額,損益,メモ",
+      "decisions_csv_row": "判断日時,売却判断,銘柄コード,市場,銘柄名,判断,根拠カテゴリ,根拠詳細,売却価格,売却実行,信頼度,メモ"
     }}
   ],
   "screened_candidates": [
@@ -177,10 +196,6 @@ JSON形式（これのみを返す。前後に説明文不要）:
   ],
   "journal_entry": "トレード日誌に残す本文（マークダウン、見出し不要、本文のみ）"
 }}
-
-## CSVヘッダー（厳守）
-- holdings.csv: 取引ID,銘柄コード,市場,銘柄名,取引種別,取引日時,株数,単価(円/USD),取引総額,通貨,ステータス,売却日時,売却単価,売却総額,損益,損益率,メモ
-- trade_decisions.csv: 判断ID,銘柄コード,市場,銘柄名,判断日時,判断種別,判断,根拠カテゴリ,推奨アクション,信頼度,エントリー候補価格,損切り候補価格,利確候補価格,投資方針summary,詳細メモ
 
 新規エントリーも売却もなければ decisions/sells は空配列でよい。JSONのみ返してください。
 """
@@ -208,6 +223,7 @@ def execute_decisions(result, holdings_csv, h_sha, summary_csv, s_sha,
 
     new_holdings = holdings_csv or ""
     new_decisions = decisions_csv or ""
+    new_summary = summary_csv or ""
 
     for d in decisions:
         row = d.get("holdings_csv_row")
@@ -216,18 +232,32 @@ def execute_decisions(result, holdings_csv, h_sha, summary_csv, s_sha,
         drow = d.get("decisions_csv_row")
         if drow:
             new_decisions = new_decisions.rstrip() + "\n" + drow + "\n"
+        srow = d.get("summary_csv_row")
+        if srow:
+            code = d.get("code", "")
+            lines = new_summary.splitlines()
+            exists = any(i > 0 and line.split(",")[0] == code for i, line in enumerate(lines))
+            if exists:
+                new_summary = "\n".join(
+                    srow if (i > 0 and line.split(",")[0] == code) else line
+                    for i, line in enumerate(lines)
+                )
+            else:
+                new_summary = new_summary.rstrip() + "\n" + srow + "\n"
 
     for s in sells:
-        old_row = None
         updated_row = s.get("holdings_csv_updated_row")
         if updated_row:
-            # 既存行をコードで探して置換
+            trade_id = s.get("trade_id", "")
             code = s.get("code", "")
             lines = new_holdings.splitlines()
             new_lines = []
             replaced = False
             for line in lines:
-                if not replaced and line.startswith(code + ",") or (not replaced and f",{code}," in line):
+                if not replaced and (
+                    (trade_id and line.startswith(trade_id + ",")) or
+                    (not trade_id and f",{code}," in line)
+                ):
                     new_lines.append(updated_row)
                     replaced = True
                 else:
@@ -235,6 +265,17 @@ def execute_decisions(result, holdings_csv, h_sha, summary_csv, s_sha,
             if not replaced:
                 new_lines.append(updated_row)
             new_holdings = "\n".join(new_lines)
+        drow = s.get("decisions_csv_row")
+        if drow:
+            new_decisions = new_decisions.rstrip() + "\n" + drow + "\n"
+        # summary から売却銘柄を削除
+        code = s.get("code", "")
+        if code:
+            lines = new_summary.splitlines()
+            new_summary = "\n".join(
+                line for i, line in enumerate(lines)
+                if i == 0 or line.split(",")[0] != code
+            )
 
     if new_holdings != (holdings_csv or ""):
         ok = write_file("data/holdings.csv", new_holdings,
@@ -245,6 +286,11 @@ def execute_decisions(result, holdings_csv, h_sha, summary_csv, s_sha,
         ok = write_file("data/trade_decisions.csv", new_decisions,
                         f"auto-trade: decisions更新 {now.strftime('%Y-%m-%d %H:%M JST')}", d_sha)
         print(f"[scan.py] trade_decisions.csv update: {'OK' if ok else 'FAILED'}")
+
+    if new_summary != (summary_csv or ""):
+        ok = write_file("data/holdings_summary.csv", new_summary,
+                        f"auto-trade: summary更新 {now.strftime('%Y-%m-%d %H:%M JST')}", s_sha)
+        print(f"[scan.py] holdings_summary.csv update: {'OK' if ok else 'FAILED'}")
 
     return len(decisions) > 0 or len(sells) > 0
 
