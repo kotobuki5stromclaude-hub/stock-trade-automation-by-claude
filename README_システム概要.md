@@ -43,8 +43,8 @@
 | `アクション候補_actions.md` | Claudeの候補提示 / kotobコメント欄 |
 | `週次レビュー_weekly_review.md` | 毎週金曜の振り返り記録 |
 | `運用フロー_workflow.md` | 処理フローとCSV仕様の詳細 |
-| `data/holdings.csv` | 取引明細（1取引1行） |
-| `data/holdings_summary.csv` | 保有銘柄サマリー（銘柄ごと集約） |
+| `data/holdings.csv` | **取引台帳（Source of Truth）** append-only。BUY/SELL を別行で追記。過去行は変更しない |
+| `data/holdings_summary.csv` | 保有サマリー。**holdings.csv から毎回再生成**（正本ではない） |
 | `data/trade_decisions.csv` | 判断ログ（買い/売り/見送りの根拠） |
 | `scripts/scan.py` | 自動スキャンスクリプト本体 |
 | `.github/workflows/stock_scan.yml` | GitHub Actions スケジュール定義 |
