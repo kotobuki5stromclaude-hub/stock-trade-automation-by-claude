@@ -166,9 +166,46 @@ def calculate_positions(holdings_csv):
     return state
 
 
-def regenerate_summary_csv(holdings_csv, now):
+def fetch_price(code, market):
+    """Yahoo Finance から現在株価を取得する（curl ベース、失敗時 None）"""
+    jpy_markets = ("東証P", "東証S", "東証G")
+    usd_markets = ("米国", "NYSE", "NASDAQ")
+    if market in jpy_markets:
+        ticker = f"{code}.T"
+    elif market in usd_markets:
+        ticker = code
+    else:
+        return None
+    r = subprocess.run(
+        ["curl", "-sf", "--max-time", "5",
+         "-H", "User-Agent: Mozilla/5.0",
+         f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"],
+        capture_output=True, text=True
+    )
+    try:
+        d = json.loads(r.stdout)
+        return d["chart"]["result"][0]["meta"]["regularMarketPrice"]
+    except Exception:
+        return None
+
+
+def fetch_all_prices(active_state):
+    """アクティブポジションの現在株価を一括取得。失敗した銘柄は None。"""
+    prices = {}
+    for code, s in active_state.items():
+        price = fetch_price(code, s["market"])
+        prices[code] = price
+        if price is not None:
+            print(f"[scan.py] 株価取得: {code} = {price}")
+        else:
+            print(f"[scan.py] 株価取得失敗: {code}（空欄で続行）")
+    return prices
+
+
+def regenerate_summary_csv(holdings_csv, now, prices=None):
     """holdings.csv から holdings_summary.csv を毎回完全再生成する"""
     state = calculate_positions(holdings_csv or "")
+    prices = prices or {}
     header = (
         "銘柄コード,市場,銘柄名,投資方針,保有株数,平均取得単価,取得総額,"
         "売却済株数,実現損益,現在株価,評価額,評価損益,評価損益率,最終更新日時"
@@ -183,9 +220,18 @@ def regenerate_summary_csv(holdings_csv, now):
         total = round(avg * s["position"], 2)
         sell_qty = int(s["sell_qty"]) if s["sell_qty"] == int(s["sell_qty"]) else round(s["sell_qty"], 4)
         realized = round(s["realized_pnl"], 2)
+        cp = prices.get(code)
+        if cp is not None:
+            eval_amount = round(cp * s["position"], 2)
+            eval_pnl   = round(eval_amount - total, 2)
+            eval_rate  = f"{round(eval_pnl / total * 100, 2):.2f}%" if total > 0 else ""
+            cp_str, ea_str, ep_str = str(round(cp, 2)), str(eval_amount), str(eval_pnl)
+        else:
+            cp_str = ea_str = ep_str = eval_rate = ""
         rows.append(
             f"{code},{s['market']},{s['name']},{s['policy']},"
-            f"{qty},{avg},{total},{sell_qty},{realized},,,,"
+            f"{qty},{avg},{total},{sell_qty},{realized},"
+            f"{cp_str},{ea_str},{ep_str},{eval_rate},"
             f"{date_str}"
         )
     return header + "\n" + "\n".join(rows) + "\n"
@@ -411,9 +457,10 @@ def execute_decisions(result, holdings_csv, h_sha, decisions_csv, d_sha):
 
 # ── 保有ポジション.md 自動生成 ──────────────────────────────────────
 
-def generate_positions_md(holdings_csv, decisions_csv, now):
+def generate_positions_md(holdings_csv, decisions_csv, now, prices=None):
     state = calculate_positions(holdings_csv or "")
     active = {code: s for code, s in state.items() if s.get("position", 0) > 0}
+    prices = prices or {}
 
     stop_map, profit_map = {}, {}
     for dl in (decisions_csv or "").splitlines()[1:]:
@@ -435,9 +482,12 @@ def generate_positions_md(holdings_csv, decisions_csv, now):
         avg = round(s["avg_cost"], 2)
         invested = round(avg * s["position"], 2)
         total_invested += invested
+        cp = prices.get(code)
+        cp_str = f"{cp:,.0f}" if cp is not None else ""
+        pnl_str = f"{round((cp - s['avg_cost']) * s['position'], 0):+,.0f}" if cp is not None else ""
         rows.append(
-            f"| {s['name']} | {code} | {s['market']} | {qty} | {avg:,.0f} |  "
-            f"| {stop_map.get(code, '')} | {profit_map.get(code, '')} |  | {s.get('entry_date', '')} | 保有中 |"
+            f"| {s['name']} | {code} | {s['market']} | {qty} | {avg:,.0f} | {cp_str} "
+            f"| {stop_map.get(code, '')} | {profit_map.get(code, '')} | {pnl_str} | {s.get('entry_date', '')} | 保有中 |"
         )
 
     position_rows = "\n".join(rows) if rows else "| (なし) |  |  |  |  |  |  |  |  |  |  |"
@@ -457,7 +507,7 @@ def generate_positions_md(holdings_csv, decisions_csv, now):
 - 投資中: 約{int(total_invested):,}円 / 現金: 約{int(cash):,}円（現金比率 {cash_ratio}%）
 - 同時保有数: {len(active)} / 上限 6銘柄
 
-> ※損切り・利確ラインは trade_decisions.csv 参照。現値・含損益はリアルタイム非対応のため空欄。
+> ※損切り・利確ラインは trade_decisions.csv 参照。現値・含損益は Yahoo Finance から取得（取得失敗時は空欄）。
 """
 
 # ── アクション候補.md 更新 ───────────────────────────────────────────
@@ -646,8 +696,12 @@ def main():
     h_latest = holdings_fresh or holdings or ""
     d_latest = decisions_fresh or decisions or ""
 
+    # アクティブポジションの現在株価を取得（一度だけ。失敗銘柄は空欄で続行）
+    active_state = {c: s for c, s in calculate_positions(h_latest).items() if s["position"] > 0}
+    prices = fetch_all_prices(active_state)
+
     # holdings_summary.csv: holdings.csv から毎回完全再生成（正本は holdings.csv）
-    summary_new = regenerate_summary_csv(h_latest, now)
+    summary_new = regenerate_summary_csv(h_latest, now, prices)
     _, s_sha = read_file("data/holdings_summary.csv")
     ok = write_file("data/holdings_summary.csv", summary_new,
                     f"scan({SCAN_TYPE}): summary再生成 {now.strftime('%Y-%m-%d %H:%M JST')}", s_sha)
@@ -655,7 +709,7 @@ def main():
 
     # 保有ポジション.md 更新
     _, p_sha = read_file("保有ポジション_positions.md")
-    pos_content = generate_positions_md(h_latest, d_latest, now)
+    pos_content = generate_positions_md(h_latest, d_latest, now, prices)
     ok = write_file("保有ポジション_positions.md", pos_content,
                     f"scan({SCAN_TYPE}): ポジション更新 {now.strftime('%Y-%m-%d %H:%M JST')}", p_sha)
     print(f"[scan.py] ポジション更新: {'OK' if ok else 'FAILED'}")
